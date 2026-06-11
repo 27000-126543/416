@@ -49,6 +49,44 @@ class QualityCheck(ABC):
 
 
 class RangeCheck(QualityCheck):
+    UNIT_MAP = {
+        "temperature": "K",
+        "sea_surface_temperature": "K",
+        "water_temperature": "K",
+        "skin_temperature": "K",
+        "sea_ice_temperature": "K",
+        "relative_humidity": "%",
+        "specific_humidity": "kg/kg",
+        "pressure": "Pa",
+        "surface_pressure": "Pa",
+        "wind_speed": "m/s",
+        "precipitation": "mm",
+        "salinity": "PSU",
+        "sea_ice_concentration": "fraction",
+        "geopotential_height": "m",
+    }
+
+    RANGE_KELVIN = {
+        "temperature": (180.0, 330.0),
+        "temperature_2m": (180.0, 320.0),
+        "water_temperature": (271.0, 305.0),
+        "sea_surface_temperature": (271.0, 305.0),
+        "skin_temperature": (200.0, 330.0),
+        "sea_ice_temperature": (200.0, 273.0),
+        "surface_pressure": (87000.0, 108500.0),
+        "pressure_sea_level": (87000.0, 108500.0),
+        "wind_speed_10m": (0.0, 85.0),
+        "wind_direction": (0.0, 360.0),
+        "wind_direction_10m": (0.0, 360.0),
+        "sea_ice_concentration": (0.0, 1.0),
+        "sea_ice_thickness": (0.0, 50.0),
+        "soil_moisture": (0.0, 1.0),
+        "albedo": (0.0, 1.0),
+        "cloud_cover": (0.0, 1.0),
+        "u_wind": (-150.0, 150.0),
+        "v_wind": (-150.0, 150.0),
+    }
+
     PHYSICAL_RANGES = {
         "temperature": (-90.0, 60.0),
         "temperature_2m": (-80.0, 55.0),
@@ -66,7 +104,7 @@ class RangeCheck(QualityCheck):
 
     def __init__(self, custom_ranges: Optional[Dict[str, Tuple[float, float]]] = None, **kwargs):
         super().__init__(name="range_check", **kwargs)
-        self.ranges = self.PHYSICAL_RANGES.copy()
+        self.ranges = self.RANGE_KELVIN.copy()
         if custom_ranges:
             self.ranges.update(custom_ranges)
 
@@ -101,6 +139,7 @@ class RangeCheck(QualityCheck):
             result.stats = {
                 "min": float(np.nanmin(data[valid])),
                 "max": float(np.nanmax(data[valid])),
+                "unit": self.UNIT_MAP.get(variable, "unknown"),
                 "range_min": min_val,
                 "range_max": max_val,
             }
@@ -736,6 +775,10 @@ class QualityControlEngine:
                         "passed": r.passed,
                         "pass_rate": r.pass_rate,
                         "failed_points": r.failed_points,
+                        "unit": r.stats.get("unit", "unknown"),
+                        "range_min": r.stats.get("range_min"),
+                        "range_max": r.stats.get("range_max"),
+                        "total_points": r.total_points,
                     }
                     for r in var_results
                 ]

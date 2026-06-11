@@ -48,12 +48,23 @@ class Permission(Enum):
 
 @dataclass
 class ResourceQuota:
-    storage_tb: float = 10.0
-    compute_hours_month: float = 1000.0
-    concurrent_jobs: int = 10
-    memory_gb: float = 128.0
+    storage_tb: float = 0.0
+    compute_hours_month: float = 0.0
+    concurrent_jobs: int = 0
+    memory_gb: float = 0.0
     gpu_count: int = 0
-    bandwidth_gbps: float = 1.0
+    bandwidth_gbps: float = 0.0
+
+    @classmethod
+    def default_research_quota(cls) -> "ResourceQuota":
+        return cls(
+            storage_tb=10.0,
+            compute_hours_month=1000.0,
+            concurrent_jobs=10,
+            memory_gb=128.0,
+            gpu_count=0,
+            bandwidth_gbps=1.0,
+        )
 
     def exceeds(self, usage: "ResourceQuota") -> Tuple[bool, List[str]]:
         exceeded = []
@@ -67,6 +78,8 @@ class ResourceQuota:
             exceeded.append(f"memory: {usage.memory_gb:.1f}GB > {self.memory_gb:.1f}GB")
         if usage.gpu_count > self.gpu_count:
             exceeded.append(f"GPU: {usage.gpu_count} > {self.gpu_count}")
+        if usage.bandwidth_gbps > self.bandwidth_gbps:
+            exceeded.append(f"bandwidth: {usage.bandwidth_gbps:.2f}Gbps > {self.bandwidth_gbps:.2f}Gbps")
         return len(exceeded) > 0, exceeded
 
     def utilization_pct(self, usage: "ResourceQuota") -> Dict[str, float]:
@@ -76,6 +89,7 @@ class ResourceQuota:
             "concurrent_jobs": min(100.0, usage.concurrent_jobs / max(self.concurrent_jobs, 1e-9) * 100),
             "memory": min(100.0, usage.memory_gb / max(self.memory_gb, 1e-9) * 100),
             "gpu": min(100.0, usage.gpu_count / max(self.gpu_count, 1) * 100),
+            "bandwidth": min(100.0, usage.bandwidth_gbps / max(self.bandwidth_gbps, 1e-9) * 100),
         }
 
 
@@ -87,6 +101,7 @@ class ResourceUsage:
     concurrent_jobs: int = 0
     memory_gb: float = 0.0
     gpu_count: int = 0
+    bandwidth_gbps: float = 0.0
     last_updated: datetime = field(default_factory=datetime.now)
 
     def to_quota(self) -> ResourceQuota:
@@ -96,6 +111,7 @@ class ResourceUsage:
             concurrent_jobs=self.concurrent_jobs,
             memory_gb=self.memory_gb,
             gpu_count=self.gpu_count,
+            bandwidth_gbps=self.bandwidth_gbps,
         )
 
 
@@ -478,7 +494,7 @@ class TenantManager:
         scaling_policy: Optional[ScalingPolicy] = None,
     ):
         self.base_sandbox_path = base_sandbox_path
-        self.default_quota = default_quota or ResourceQuota()
+        self.default_quota = default_quota or ResourceQuota.default_research_quota()
         self.enable_sandbox_isolation = enable_sandbox_isolation
         self.tenants: Dict[str, Tenant] = {}
         self.acl = AccessControlList()
@@ -552,6 +568,7 @@ class TenantManager:
             concurrent_jobs=tenant.usage.concurrent_jobs + requested.concurrent_jobs,
             memory_gb=tenant.usage.memory_gb + requested.memory_gb,
             gpu_count=tenant.usage.gpu_count + requested.gpu_count,
+            bandwidth_gbps=tenant.usage.bandwidth_gbps + requested.bandwidth_gbps,
         )
         exceeded, reasons = tenant.quota.exceeds(projected_usage.to_quota())
         return (not exceeded), reasons
@@ -571,6 +588,7 @@ class TenantManager:
             tenant.usage.concurrent_jobs += requested.concurrent_jobs
             tenant.usage.memory_gb += requested.memory_gb
             tenant.usage.gpu_count += requested.gpu_count
+            tenant.usage.bandwidth_gbps += requested.bandwidth_gbps
             tenant.usage.last_updated = datetime.now()
 
         return True
@@ -586,6 +604,7 @@ class TenantManager:
             tenant.usage.concurrent_jobs = max(0, tenant.usage.concurrent_jobs - released.concurrent_jobs)
             tenant.usage.memory_gb = max(0.0, tenant.usage.memory_gb - released.memory_gb)
             tenant.usage.gpu_count = max(0, tenant.usage.gpu_count - released.gpu_count)
+            tenant.usage.bandwidth_gbps = max(0.0, tenant.usage.bandwidth_gbps - released.bandwidth_gbps)
             tenant.usage.last_updated = datetime.now()
 
     def grant_resource_permission(

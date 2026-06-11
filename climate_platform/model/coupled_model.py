@@ -433,7 +433,7 @@ class OceanModel(ModelComponent):
         lon_grid, lat_grid = np.meshgrid(lon, lat)
         lon_3d, lat_3d, depth_3d = np.meshgrid(lon, lat, depths)
 
-        sst = 30 * np.cos(np.radians(lat_grid)) - 2
+        sst = 30 * np.cos(np.radians(lat_grid)) - 2 + 273.15
         ds["sea_surface_temperature"] = (["lat", "lon"], sst)
 
         temp_profile = np.zeros((n_lat, n_lon, n_lev))
@@ -947,14 +947,17 @@ class CoupledModel:
                     CouplingVariableMap(
                         source_var="water_temperature", target_var="sea_ice_temperature",
                         method=CouplingMethod.RELAXATION, relaxation_time_seconds=5*86400,
+                        source_level=5,
                     ),
                     CouplingVariableMap(
                         source_var="u_current", target_var="ice_u_velocity",
-                        method=CouplingMethod.DIRECT, scale_factor=0.3,
+                        method=CouplingMethod.DIRECT, scale_factor=0.01,
+                        source_level=5,
                     ),
                     CouplingVariableMap(
                         source_var="v_current", target_var="ice_v_velocity",
-                        method=CouplingMethod.DIRECT, scale_factor=0.3,
+                        method=CouplingMethod.DIRECT, scale_factor=0.01,
+                        source_level=5,
                     ),
                 ]
             ))
@@ -963,7 +966,7 @@ class CoupledModel:
                 variable_maps=[
                     CouplingVariableMap(
                         source_var="sea_ice_concentration", target_var="sea_surface_temperature",
-                        method=CouplingMethod.FLUX, scale_factor=-5.0,
+                        method=CouplingMethod.FLUX, scale_factor=-5e-6,
                     ),
                 ]
             ))
@@ -989,8 +992,8 @@ class CoupledModel:
                 source_model="sea_ice", target_model="atmosphere",
                 variable_maps=[
                     CouplingVariableMap(
-                        source_var="sea_ice_concentration", target_var="albedo",
-                        method=CouplingMethod.DIRECT, scale_factor=0.5,
+                        source_var="sea_ice_concentration", target_var="shortwave_radiation",
+                        method=CouplingMethod.FLUX, scale_factor=-0.01,
                     ),
                 ]
             ))

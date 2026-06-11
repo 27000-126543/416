@@ -30,6 +30,7 @@ class QualityControlResult:
     overall_quality: float
     variable_quality: Dict[str, float] = field(default_factory=dict)
     failures: List[QCFailure] = field(default_factory=list)
+    variable_details: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     cleaned: bool = False
     timestamp: datetime = field(default_factory=datetime.now)
 
@@ -47,6 +48,55 @@ class QualityControlResult:
 
 
 class DataCleaner:
+    UNIT_MAP = {
+        "temperature": "K",
+        "sea_surface_temperature": "K",
+        "water_temperature": "K",
+        "skin_temperature": "K",
+        "sea_ice_temperature": "K",
+        "relative_humidity": "%",
+        "specific_humidity": "kg/kg",
+        "pressure": "Pa",
+        "surface_pressure": "Pa",
+        "wind_speed": "m/s",
+        "precipitation": "mm",
+        "salinity": "PSU",
+        "sea_ice_concentration": "fraction",
+        "geopotential_height": "m",
+    }
+
+    RANGE_KELVIN = {
+        "temperature": (180.0, 330.0),
+        "temperature_2m": (180.0, 320.0),
+        "temperature_surface": (180.0, 330.0),
+        "water_temperature": (271.0, 305.0),
+        "sea_surface_temperature": (271.0, 305.0),
+        "skin_temperature": (200.0, 330.0),
+        "sea_ice_temperature": (200.0, 273.0),
+        "relative_humidity": (0.0, 100.0),
+        "specific_humidity": (0.0, 0.05),
+        "pressure": (87000.0, 108500.0),
+        "pressure_surface": (87000.0, 108500.0),
+        "pressure_sea_level": (87000.0, 108500.0),
+        "surface_pressure": (87000.0, 108500.0),
+        "wind_speed": (0.0, 150.0),
+        "wind_speed_10m": (0.0, 85.0),
+        "u_wind": (-150.0, 150.0),
+        "v_wind": (-150.0, 150.0),
+        "wind_direction": (0.0, 360.0),
+        "wind_direction_10m": (0.0, 360.0),
+        "precipitation": (0.0, 1000.0),
+        "salinity": (0.0, 42.0),
+        "geopotential_height": (0.0, 50000.0),
+        "vorticity": (-1e-2, 1e-2),
+        "divergence": (-1e-3, 1e-3),
+        "sea_ice_concentration": (0.0, 1.0),
+        "sea_ice_thickness": (0.0, 50.0),
+        "soil_moisture": (0.0, 1.0),
+        "albedo": (0.0, 1.0),
+        "cloud_cover": (0.0, 1.0),
+    }
+
     PHYSICAL_RANGES = {
         "temperature": (180.0, 330.0),
         "temperature_2m": (180.0, 320.0),
@@ -139,8 +189,9 @@ class DataCleaner:
 
         try:
             if "lat" in ds.coords and "lon" in ds.coords:
-                lat_axis = ds.dims.index("lat") if "lat" in ds.dims else None
-                lon_axis = ds.dims.index("lon") if "lon" in ds.dims else None
+                dims = list(ds.dims)
+                lat_axis = dims.index("lat") if "lat" in dims else None
+                lon_axis = dims.index("lon") if "lon" in dims else None
 
                 if lat_axis is not None and lon_axis is not None:
                     grad_lat = np.abs(np.gradient(data, axis=lat_axis))
@@ -170,7 +221,7 @@ class DataCleaner:
         if "time" not in ds.dims or ds.sizes["time"] < 3:
             return None
 
-        time_axis = ds.dims.index("time")
+        time_axis = list(ds.dims).index("time")
         try:
             diff1 = np.diff(data, axis=time_axis)
             diff2 = np.diff(diff1, axis=time_axis)
@@ -238,7 +289,8 @@ class DataCleaner:
 
         try:
             if "time" in ds.dims and data.ndim >= 1:
-                time_axis = ds.dims.index("time")
+                dims = list(ds.dims)
+                time_axis = dims.index("time")
                 if data.ndim == 1:
                     x = np.arange(len(cleaned))
                     valid = ~np.isnan(cleaned)
@@ -265,8 +317,9 @@ class DataCleaner:
             has_lat = "lat" in ds.dims
             has_lon = "lon" in ds.dims
             if has_lat and has_lon and cleaned.ndim >= 2:
-                lat_axis = ds.dims.index("lat")
-                lon_axis = ds.dims.index("lon")
+                dims = list(ds.dims)
+                lat_axis = dims.index("lat")
+                lon_axis = dims.index("lon")
 
                 for _ in range(10):
                     if not np.any(np.isnan(cleaned)):
@@ -388,7 +441,7 @@ class DataCleaner:
             passed=qc_result.passed,
             overall_quality=qc_result.overall_quality,
             variable_quality=qc_result.variable_quality,
-            failures=[],
+            failures=qc_result.failures,
             cleaned=True,
         )
 

@@ -56,6 +56,25 @@ class IngestionStats:
     last_update: datetime = field(default_factory=datetime.now)
 
 
+class SourceSessionState(Enum):
+    RUNNING = "running"
+    STOPPED = "stopped"
+    ERROR = "error"
+
+
+@dataclass
+class SourceSession:
+    source_id: str
+    state: SourceSessionState
+    session_start: datetime = field(default_factory=datetime.now)
+    session_end: Optional[datetime] = None
+    session_chunks: int = 0
+    session_bytes: int = 0
+    cumulative_chunks: int = 0
+    cumulative_bytes: int = 0
+    session_rate_mbps: float = 0.0
+
+
 class DataSource:
     def __init__(
         self,
@@ -383,6 +402,11 @@ class DataIngestionManager:
         self._semaphore = asyncio.Semaphore(parallel_workers)
         self._bytes_processed = 0
         self._start_time = None
+        self._sessions: Dict[str, SourceSession] = {}
+        self._manager_state: SourceSessionState = SourceSessionState.STOPPED
+        self._cumulative_stats = IngestionStats()
+        self._session_id = 0
+        self._current_session_id = 0
 
     def register_source(self, source: DataSource):
         self._sources[source.source_id] = source
@@ -396,18 +420,31 @@ class DataIngestionManager:
             del self._sources[source_id]
             logger.info(f"Unregistered data source: {source_id}")
 
-    async def _on_data_received(self, chunk: DataChunk):
+    def _on_data_received(self, chunk: DataChunk):
+        source_id = chunk.source_id
+        session = self._sessions.get(source_id)
+        if session is None or session.state != SourceSessionState.RUNNING:
+            return
+
         self._stats.total_chunks += 1
         self._stats.total_bytes += chunk.chunk_size_bytes
         self._stats.last_update = datetime.now()
 
-        source_id = chunk.source_id
         if source_id not in self._source_stats:
             self._source_stats[source_id] = IngestionStats()
         src_stats = self._source_stats[source_id]
         src_stats.total_chunks += 1
         src_stats.total_bytes += chunk.chunk_size_bytes
         src_stats.last_update = datetime.now()
+
+        session.session_chunks += 1
+        session.session_bytes += chunk.chunk_size_bytes
+        session.cumulative_chunks += 1
+        session.cumulative_bytes += chunk.chunk_size_bytes
+
+        self._cumulative_stats.total_chunks += 1
+        self._cumulative_stats.total_bytes += chunk.chunk_size_bytes
+        self._cumulative_stats.last_update = datetime.now()
 
         now = datetime.now()
         self._rate_window.append((now, chunk.chunk_size_bytes))
@@ -417,15 +454,30 @@ class DataIngestionManager:
             elapsed = (now - self._rate_window[0][0]).total_seconds()
             if elapsed > 0:
                 total_bytes_in_window = sum(b for _, b in self._rate_window)
-                self._stats.avg_ingestion_rate_mbps = (total_bytes_in_window * 8) / (elapsed * 1e6)
-                src_stats.avg_ingestion_rate_mbps = self._stats.avg_ingestion_rate_mbps
+                rate_mbps = (total_bytes_in_window * 8) / (elapsed * 1e6)
+                self._stats.avg_ingestion_rate_mbps = rate_mbps
+                src_stats.avg_ingestion_rate_mbps = rate_mbps
+                session.session_rate_mbps = rate_mbps
 
-        await self._buffer.put(chunk)
+        asyncio.create_task(self._buffer.put(chunk))
 
     async def start(self):
         self._is_running = True
         self._start_time = datetime.now()
         self._bytes_processed = 0
+        self._manager_state = SourceSessionState.RUNNING
+        for source_id in self._sources:
+            if source_id not in self._sessions or self._sessions[source_id].state != SourceSessionState.RUNNING:
+                self._session_id += 1
+                self._current_session_id = self._session_id
+                prev = self._sessions.get(source_id)
+                self._sessions[source_id] = SourceSession(
+                    source_id=source_id,
+                    state=SourceSessionState.RUNNING,
+                    session_start=datetime.now(),
+                    cumulative_chunks=prev.cumulative_chunks if prev else 0,
+                    cumulative_bytes=prev.cumulative_bytes if prev else 0,
+                )
         logger.info("Starting data ingestion manager")
 
         tasks = []
@@ -438,6 +490,11 @@ class DataIngestionManager:
 
     async def stop(self):
         self._is_running = False
+        self._manager_state = SourceSessionState.STOPPED
+        for source_id, session in self._sessions.items():
+            if session.state == SourceSessionState.RUNNING:
+                session.state = SourceSessionState.STOPPED
+                session.session_end = datetime.now()
         for source in self._sources.values():
             await source.stop()
         logger.info("Stopped data ingestion manager")
@@ -470,13 +527,74 @@ class DataIngestionManager:
             await asyncio.sleep(5)
 
     def get_stats(self) -> IngestionStats:
-        return self._stats
+        has_active = any(s.state == SourceSessionState.RUNNING for s in self._sessions.values())
+        if has_active:
+            return self._stats
+        return self._cumulative_stats
 
     def get_source_stats(self, source_id: str) -> Optional[IngestionStats]:
         return self._source_stats.get(source_id)
 
     def get_all_source_stats(self) -> Dict[str, IngestionStats]:
         return self._source_stats.copy()
+
+    def start_ingestion(self, source_id: Optional[str] = None) -> Dict:
+        if source_id is not None:
+            if source_id not in self._sources:
+                raise ValueError(f"Unknown source: {source_id}")
+            self._session_id += 1
+            self._current_session_id = self._session_id
+            prev = self._sessions.get(source_id)
+            self._sessions[source_id] = SourceSession(
+                source_id=source_id,
+                state=SourceSessionState.RUNNING,
+                session_start=datetime.now(),
+                cumulative_chunks=prev.cumulative_chunks if prev else 0,
+                cumulative_bytes=prev.cumulative_bytes if prev else 0,
+            )
+            return {"source_id": source_id, "session_id": self._current_session_id, "state": SourceSessionState.RUNNING.value}
+        else:
+            results = {}
+            for sid in self._sources:
+                self._session_id += 1
+                self._current_session_id = self._session_id
+                prev = self._sessions.get(sid)
+                self._sessions[sid] = SourceSession(
+                    source_id=sid,
+                    state=SourceSessionState.RUNNING,
+                    session_start=datetime.now(),
+                    cumulative_chunks=prev.cumulative_chunks if prev else 0,
+                    cumulative_bytes=prev.cumulative_bytes if prev else 0,
+                )
+                results[sid] = {"source_id": sid, "session_id": self._current_session_id, "state": SourceSessionState.RUNNING.value}
+            return results
+
+    def stop_ingestion(self, source_id: Optional[str] = None) -> Dict:
+        if source_id is not None:
+            session = self._sessions.get(source_id)
+            if session is None:
+                raise ValueError(f"No session for source: {source_id}")
+            if session.state == SourceSessionState.RUNNING:
+                session.state = SourceSessionState.STOPPED
+                session.session_end = datetime.now()
+            return {"source_id": source_id, "state": session.state.value, "session_chunks": session.session_chunks, "session_bytes": session.session_bytes}
+        else:
+            results = {}
+            for sid, session in self._sessions.items():
+                if session.state == SourceSessionState.RUNNING:
+                    session.state = SourceSessionState.STOPPED
+                    session.session_end = datetime.now()
+                results[sid] = {"source_id": sid, "state": session.state.value, "session_chunks": session.session_chunks, "session_bytes": session.session_bytes}
+            return results
+
+    def get_session(self, source_id: str) -> Optional[SourceSession]:
+        return self._sessions.get(source_id)
+
+    def get_all_sessions(self) -> Dict[str, SourceSession]:
+        return self._sessions.copy()
+
+    def get_cumulative_stats(self) -> IngestionStats:
+        return self._cumulative_stats
 
     def get_sources(self) -> Dict[str, DataSource]:
         return self._sources.copy()
