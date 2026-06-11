@@ -1,0 +1,164 @@
+system:
+  name: "Global Climate Simulation Platform"
+  version: "1.0.0"
+  log_level: "INFO"
+  data_dir: "./data"
+  result_dir: "./results"
+  scratch_dir: "./scratch"
+
+data_stream:
+  ingestion_rate_limit_tbps: 1.0
+  buffer_size_mb: 1024
+  parallel_workers: 64
+  sources:
+    satellite:
+      type: "satellite_remote_sensing"
+      formats: ["netcdf4", "hdf5", "grib2"]
+      max_retention_days: 30
+      quality_threshold: 0.85
+    ground_station:
+      type: "surface_observation"
+      formats: ["csv", "netcdf4", "bufr"]
+      max_retention_days: 3650
+      quality_threshold: 0.90
+    ocean_buoy:
+      type: "ocean_mooring"
+      formats: ["netcdf4", "csv"]
+      max_retention_days: 3650
+      quality_threshold: 0.88
+
+data_assimilation:
+  method: "enkf"
+  ensemble_size: 100
+  localization_radius_km: 500.0
+  inflation_factor: 1.05
+  covariance_inflation: "multiplicative"
+  time_window_hours: 6
+
+numerical_model:
+  coupling:
+    atmosphere_ocean: true
+    atmosphere_land: true
+    ocean_seaice: true
+    fully_coupled: true
+    coupling_interval_seconds: 900
+  resolution:
+    base_resolution_deg: 0.25
+    max_refinement_level: 4
+    min_cell_size_km: 1.0
+  adaptive_mesh:
+    enabled: true
+    refinement_criteria:
+      - variable: "temperature_gradient"
+        threshold: 5.0
+      - variable: "vorticity"
+        threshold: 1e-4
+      - variable: "pressure_change"
+        threshold: 100.0
+    extreme_weather_focus:
+      - type: "typhoon"
+        detection_vars: ["vorticity", "pressure", "wind_speed"]
+        focus_radius_km: 1000.0
+      - type: "heatwave"
+        detection_vars: ["temperature_2m", "humidity"]
+        focus_radius_km: 2000.0
+
+ensemble_forecast:
+  enabled: true
+  ensemble_size: 50
+  perturbation_method: "bred"
+  breeding_cycles: 5
+  forecast_horizons:
+    short_range_days: 10
+    medium_range_days: 30
+    seasonal_months: 6
+    long_term_years: 30
+  probability_calibration: "bayesian"
+
+climate_fingerprint:
+  time_frequency_analysis:
+    methods: ["wavelet", "fft", "hilbert_huang"]
+    wavelet: "morlet"
+    scales_per_octave: 12
+  causal_inference:
+    method: "pc_stable"
+    significance_level: 0.05
+    max_lag: 10
+  pattern_matching:
+    similarity_metric: "cosine"
+    top_k_results: 20
+    temporal_weight: 0.6
+    spatial_weight: 0.4
+
+orchestration:
+  engine: "dask"
+  max_parallel_tasks: 1024
+  checkpoint_interval_seconds: 3600
+  retry_attempts: 3
+  retry_backoff_seconds: 60
+  dependency_resolution: "topological"
+  result_validation:
+    enabled: true
+    checksum_algorithm: "sha256"
+  parameter_sweep:
+    method: "latin_hypercube"
+    max_samples: 1000
+    optimization_method: "bayesian"
+    optimization_iterations: 100
+
+multi_tenant:
+  enabled: true
+  sandbox_isolation: true
+  default_quota:
+    storage_tb: 10
+    compute_hours_month: 1000
+    concurrent_jobs: 10
+  tenants:
+    - id: "ipcc"
+      name: "IPCC Working Group"
+      role: "research"
+    - id: "nms"
+      name: "National Meteorological Service"
+      role: "operational"
+    - id: "university"
+      name: "University Research Groups"
+      role: "academic"
+  collaboration:
+    enabled: true
+    data_sharing: "controlled"
+  dynamic_scaling:
+    enabled: true
+    scaling_policy: "auto"
+    min_workers: 16
+    max_workers: 1024
+    scale_up_threshold: 0.75
+    scale_down_threshold: 0.25
+    cooldown_seconds: 300
+
+visualization:
+  backend: "pyvista"
+  interactive: true
+  render_quality: "high"
+  output_formats: ["html", "png", "mp4", "glb"]
+  modules:
+    wind_streamlines: true
+    isosurfaces: true
+    volume_rendering: true
+    statistics: true
+  temporal_playback:
+    enabled: true
+    default_fps: 24
+
+quality_control:
+  enabled: true
+  checks:
+    range_check: true
+    gradient_check: true
+    spatial_consistency: true
+    temporal_consistency: true
+    buddy_check: true
+  versioning:
+    enabled: true
+    algorithm: "semver"
+    metadata_tracking: true
+    provenance_graph: true
