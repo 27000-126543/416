@@ -357,10 +357,30 @@ class Tenant:
     is_active: bool = True
     created_at: datetime = field(default_factory=datetime.now)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    _resource_history: List[ResourceEvent] = field(default_factory=list)
 
     def __post_init__(self):
         if self.usage is None:
             self.usage = ResourceUsage(tenant_id=self.tenant_id)
+
+    def get_resource_history(self, event_type: Optional[str] = None) -> List[ResourceEvent]:
+        if event_type is None:
+            return list(self._resource_history)
+        return [e for e in self._resource_history if e.event_type == event_type]
+
+    def get_usage_summary(self) -> Dict[str, Any]:
+        return {
+            "tenant_id": self.tenant_id,
+            "usage": {
+                "storage_tb": {"used": self.usage.storage_tb, "quota": self.quota.storage_tb, "remaining": max(0, self.quota.storage_tb - self.usage.storage_tb)},
+                "compute_hours_month": {"used": self.usage.compute_hours_month, "quota": self.quota.compute_hours_month, "remaining": max(0, self.quota.compute_hours_month - self.usage.compute_hours_month)},
+                "concurrent_jobs": {"used": self.usage.concurrent_jobs, "quota": self.quota.concurrent_jobs, "remaining": max(0, self.quota.concurrent_jobs - self.usage.concurrent_jobs)},
+                "memory_gb": {"used": self.usage.memory_gb, "quota": self.quota.memory_gb, "remaining": max(0, self.quota.memory_gb - self.usage.memory_gb)},
+                "gpu_count": {"used": self.usage.gpu_count, "quota": self.quota.gpu_count, "remaining": max(0, self.quota.gpu_count - self.usage.gpu_count)},
+                "bandwidth_gbps": {"used": self.usage.bandwidth_gbps, "quota": self.quota.bandwidth_gbps, "remaining": max(0, self.quota.bandwidth_gbps - self.usage.bandwidth_gbps)},
+            },
+            "last_updated": self.usage.last_updated.isoformat(),
+        }
 
     def get_quota_utilization(self) -> Dict[str, float]:
         return self.quota.utilization_pct(self.usage.to_quota())
@@ -584,13 +604,17 @@ class TenantManager:
         return (not exceeded), reasons
 
     def allocate_resources(self, tenant_id: str, requested: ResourceQuota) -> bool:
+        ok, _ = self.allocate_resources_detailed(tenant_id, requested)
+        return ok
+
+    def allocate_resources_detailed(self, tenant_id: str, requested: ResourceQuota) -> Tuple[bool, List[str]]:
         tenant = self.get_tenant(tenant_id)
         if tenant is None:
-            return False
+            return False, [f"Tenant {tenant_id} not found"]
 
-        ok, _ = self.check_resource_available(tenant_id, requested)
+        ok, reasons = self.check_resource_available(tenant_id, requested)
         if not ok:
-            return False
+            return False, reasons
 
         with self._lock:
             tenant.usage.storage_tb += requested.storage_tb
@@ -601,7 +625,23 @@ class TenantManager:
             tenant.usage.bandwidth_gbps += requested.bandwidth_gbps
             tenant.usage.last_updated = datetime.now()
 
-        return True
+            event = ResourceEvent(
+                event_id=str(uuid.uuid4()),
+                tenant_id=tenant_id,
+                event_type="allocate",
+                timestamp=datetime.now(),
+                resources={
+                    "storage_tb": requested.storage_tb,
+                    "compute_hours_month": requested.compute_hours_month,
+                    "concurrent_jobs": float(requested.concurrent_jobs),
+                    "memory_gb": requested.memory_gb,
+                    "gpu_count": float(requested.gpu_count),
+                    "bandwidth_gbps": requested.bandwidth_gbps,
+                },
+            )
+            tenant._resource_history.append(event)
+
+        return True, []
 
     def release_resources(self, tenant_id: str, released: ResourceQuota):
         tenant = self.get_tenant(tenant_id)
@@ -616,6 +656,34 @@ class TenantManager:
             tenant.usage.gpu_count = max(0, tenant.usage.gpu_count - released.gpu_count)
             tenant.usage.bandwidth_gbps = max(0.0, tenant.usage.bandwidth_gbps - released.bandwidth_gbps)
             tenant.usage.last_updated = datetime.now()
+
+            event = ResourceEvent(
+                event_id=str(uuid.uuid4()),
+                tenant_id=tenant_id,
+                event_type="release",
+                timestamp=datetime.now(),
+                resources={
+                    "storage_tb": released.storage_tb,
+                    "compute_hours_month": released.compute_hours_month,
+                    "concurrent_jobs": float(released.concurrent_jobs),
+                    "memory_gb": released.memory_gb,
+                    "gpu_count": float(released.gpu_count),
+                    "bandwidth_gbps": released.bandwidth_gbps,
+                },
+            )
+            tenant._resource_history.append(event)
+
+    def get_tenant_usage(self, tenant_id: str) -> Optional[Dict[str, Any]]:
+        tenant = self.get_tenant(tenant_id)
+        if tenant is None:
+            return None
+        return tenant.get_usage_summary()
+
+    def get_tenant_history(self, tenant_id: str, event_type: Optional[str] = None) -> List[ResourceEvent]:
+        tenant = self.get_tenant(tenant_id)
+        if tenant is None:
+            return []
+        return tenant.get_resource_history(event_type)
 
     def grant_resource_permission(
         self,

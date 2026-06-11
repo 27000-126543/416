@@ -426,6 +426,15 @@ class DataIngestionManager:
     def register_source(self, source: DataSource):
         self._sources[source.source_id] = source
         source.subscribe(self._on_data_received)
+        self._session_id += 1
+        prev = self._sessions.get(source.source_id)
+        self._sessions[source.source_id] = SourceSession(
+            source_id=source.source_id,
+            state=SourceSessionState.RUNNING,
+            session_start=datetime.now(),
+            cumulative_chunks=prev.cumulative_chunks if prev else 0,
+            cumulative_bytes=prev.cumulative_bytes if prev else 0,
+        )
         logger.info(f"Registered data source: {source.source_id} ({source.source_type.value})")
 
     def unregister_source(self, source_id: str):
@@ -474,7 +483,14 @@ class DataIngestionManager:
                 src_stats.avg_ingestion_rate_mbps = rate_mbps
                 session.session_rate_mbps = rate_mbps
 
-        asyncio.create_task(self._buffer.put(chunk))
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._buffer.put(chunk))
+        except RuntimeError:
+            try:
+                self._buffer.put_nowait(chunk)
+            except asyncio.QueueFull:
+                logger.warning(f"Buffer full, dropping chunk from {source_id}")
 
     async def start(self):
         self._is_running = True

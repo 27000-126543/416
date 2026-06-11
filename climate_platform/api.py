@@ -264,9 +264,21 @@ async def list_tenants():
             "sandboxes": len(tenant.sandboxes),
             "workspaces": len(tenant.workspaces),
             "quota_utilization": tenant.get_quota_utilization(),
+            "usage_summary": tenant.get_usage_summary(),
         })
 
     return {"tenants": tenants, "total": len(tenants)}
+
+
+@app.get("/tenants/{tenant_id}/usage", tags=["Multi-Tenant"])
+async def get_tenant_usage(tenant_id: str):
+    if not platform:
+        raise HTTPException(status_code=503, detail="Platform not initialized")
+
+    usage = platform.tenant_manager.get_tenant_usage(tenant_id)
+    if usage is None:
+        raise HTTPException(status_code=404, detail=f"Tenant {tenant_id} not found")
+    return usage
 
 
 @app.post("/qc/validate", tags=["Quality Control"])
