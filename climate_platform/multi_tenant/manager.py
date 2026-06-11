@@ -116,6 +116,16 @@ class ResourceUsage:
 
 
 @dataclass
+class ResourceEvent:
+    event_id: str
+    tenant_id: str
+    event_type: str
+    timestamp: datetime
+    resources: Dict[str, float]
+    reason: str = ""
+
+
+@dataclass
 class User:
     user_id: str
     username: str

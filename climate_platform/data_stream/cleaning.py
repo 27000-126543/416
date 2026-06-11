@@ -47,6 +47,20 @@ class QualityControlResult:
         return summary
 
 
+@dataclass
+class QCSummary:
+    source_id: str
+    source_type: str
+    timestamp: datetime = field(default_factory=datetime.now)
+    original_anomaly_points: int = 0
+    original_nan_count: int = 0
+    cleaned_nan_count: int = 0
+    modified_points: int = 0
+    variable_summaries: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    passed: bool = True
+    overall_pass_rate: float = 1.0
+
+
 class DataCleaner:
     UNIT_MAP = {
         "temperature": "K",
@@ -356,6 +370,7 @@ class DataCleaner:
     def run_qc(self, ds: xr.Dataset) -> QualityControlResult:
         failures: List[QCFailure] = []
         variable_quality: Dict[str, float] = {}
+        variable_details: Dict[str, Dict[str, Any]] = {}
 
         for var_name in ds.data_vars:
             var_failures: List[QCFailure] = []
@@ -390,6 +405,15 @@ class DataCleaner:
             else:
                 variable_quality[var_name] = 1.0
 
+            variable_details[var_name] = {
+                "unit": self.UNIT_MAP.get(var_name, "unknown"),
+                "range_min": self.PHYSICAL_RANGES.get(var_name, (None, None))[0],
+                "range_max": self.PHYSICAL_RANGES.get(var_name, (None, None))[1],
+                "total_points": int(data.size),
+                "failed_points": sum(f.num_failures for f in var_failures),
+                "pass_rate": max(0.0, 1.0 - sum(f.num_failures for f in var_failures) / max(data.size, 1)),
+            }
+
         overall_quality = (
             np.mean(list(variable_quality.values())) if variable_quality else 1.0
         )
@@ -401,6 +425,7 @@ class DataCleaner:
             overall_quality=overall_quality,
             variable_quality=variable_quality,
             failures=failures,
+            variable_details=variable_details,
             cleaned=False,
         )
 
@@ -442,6 +467,7 @@ class DataCleaner:
             overall_quality=qc_result.overall_quality,
             variable_quality=qc_result.variable_quality,
             failures=qc_result.failures,
+            variable_details=qc_result.variable_details,
             cleaned=True,
         )
 
@@ -461,3 +487,71 @@ class DataCleaner:
                 issues.append(f"Variable '{var_name}' is empty")
 
         return len(issues) == 0, issues
+
+    def run_qc_with_summary(self, ds: xr.Dataset, source_id: str = "unknown", source_type: str = "unknown") -> Tuple[QualityControlResult, QCSummary]:
+        original_nan_by_var: Dict[str, int] = {}
+        total_original_nan = 0
+        for var_name in ds.data_vars:
+            data = ds[var_name].values
+            nan_count = int(np.sum(np.isnan(data)))
+            original_nan_by_var[var_name] = nan_count
+            total_original_nan += nan_count
+
+        result = self.run_qc(ds)
+
+        cleaned_ds = result.dataset
+        total_cleaned_nan = 0
+        cleaned_nan_by_var: Dict[str, int] = {}
+        for var_name in cleaned_ds.data_vars:
+            data = cleaned_ds[var_name].values
+            nan_count = int(np.sum(np.isnan(data)))
+            cleaned_nan_by_var[var_name] = nan_count
+            total_cleaned_nan += nan_count
+
+        total_modified = 0
+        modified_by_var: Dict[str, int] = {}
+        for var_name in ds.data_vars:
+            if var_name not in cleaned_ds.data_vars:
+                continue
+            orig_data = ds[var_name].values
+            clean_data = cleaned_ds[var_name].values
+            if orig_data.shape != clean_data.shape:
+                continue
+            both_finite = np.isfinite(orig_data) & np.isfinite(clean_data)
+            modified = int(np.sum(both_finite & (orig_data != clean_data)))
+            modified_by_var[var_name] = modified
+            total_modified += modified
+
+        total_anomaly_points = sum(f.num_failures for f in result.failures)
+
+        var_summaries: Dict[str, Dict[str, Any]] = {}
+        for var_name in ds.data_vars:
+            var_anomalies = sum(f.num_failures for f in result.failures if f.variable == var_name)
+            var_total = ds[var_name].values.size
+            var_pass_rate = max(0.0, 1.0 - var_anomalies / max(var_total, 1))
+            var_summaries[var_name] = {
+                "original_nan": original_nan_by_var.get(var_name, 0),
+                "cleaned_nan": cleaned_nan_by_var.get(var_name, 0),
+                "anomalies": var_anomalies,
+                "modified": modified_by_var.get(var_name, 0),
+                "pass_rate": var_pass_rate,
+                "unit": self.UNIT_MAP.get(var_name, "unknown"),
+                "range_min": self.PHYSICAL_RANGES.get(var_name, (None, None))[0],
+                "range_max": self.PHYSICAL_RANGES.get(var_name, (None, None))[1],
+            }
+
+        passed = result.passed or (result.overall_quality >= self.quality_threshold)
+
+        summary = QCSummary(
+            source_id=source_id,
+            source_type=source_type,
+            original_anomaly_points=total_anomaly_points,
+            original_nan_count=total_original_nan,
+            cleaned_nan_count=total_cleaned_nan,
+            modified_points=total_modified,
+            variable_summaries=var_summaries,
+            passed=passed,
+            overall_pass_rate=result.overall_quality,
+        )
+
+        return result, summary

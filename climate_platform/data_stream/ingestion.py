@@ -16,6 +16,8 @@ import numpy as np
 import xarray as xr
 import pandas as pd
 
+from .cleaning import DataCleaner, QCSummary
+
 logger = logging.getLogger(__name__)
 
 
@@ -407,6 +409,19 @@ class DataIngestionManager:
         self._cumulative_stats = IngestionStats()
         self._session_id = 0
         self._current_session_id = 0
+        self._pipeline_enabled: bool = False
+        self._qc_summaries: List[QCSummary] = []
+        self._cleaner: Optional[DataCleaner] = None
+
+    def enable_pipeline(self, cleaner: Optional[DataCleaner] = None):
+        self._pipeline_enabled = True
+        self._cleaner = cleaner or DataCleaner(auto_clean=True)
+
+    def disable_pipeline(self):
+        self._pipeline_enabled = False
+
+    def get_qc_summaries(self) -> List[QCSummary]:
+        return self._qc_summaries.copy()
 
     def register_source(self, source: DataSource):
         self._sources[source.source_id] = source
@@ -513,6 +528,11 @@ class DataIngestionManager:
     async def _process_chunk(self, chunk: DataChunk):
         try:
             self._bytes_processed += chunk.chunk_size_bytes
+            if self._pipeline_enabled and self._cleaner is not None:
+                _, summary = self._cleaner.run_qc_with_summary(
+                    chunk.data, source_id=chunk.source_id, source_type=chunk.source_type.value
+                )
+                self._qc_summaries.append(summary)
         except Exception as e:
             self._stats.failed_chunks += 1
             logger.error(f"Error processing chunk from {chunk.source_id}: {e}")
@@ -598,6 +618,31 @@ class DataIngestionManager:
 
     def get_sources(self) -> Dict[str, DataSource]:
         return self._sources.copy()
+
+    def ingest_and_qc(self, source_id: str, data: xr.Dataset, timestamp: Optional[datetime] = None) -> Optional[QCSummary]:
+        if source_id not in self._sources:
+            return None
+        session = self._sessions.get(source_id)
+        if session is None or session.state != SourceSessionState.RUNNING:
+            return None
+
+        ts = timestamp or datetime.now()
+        source = self._sources[source_id]
+        chunk = DataChunk(
+            source_id=source_id,
+            source_type=source.source_type,
+            timestamp=ts,
+            data=data,
+        )
+        self._on_data_received(chunk)
+
+        if self._pipeline_enabled and self._cleaner is not None:
+            _, summary = self._cleaner.run_qc_with_summary(
+                data, source_id=source_id, source_type=source.source_type.value
+            )
+            self._qc_summaries.append(summary)
+            return summary
+        return None
 
     @property
     def is_running(self) -> bool:

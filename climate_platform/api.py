@@ -270,7 +270,10 @@ async def list_tenants():
 
 
 @app.post("/qc/validate", tags=["Quality Control"])
-async def validate_dataset(min_pass_rate: float = 0.95):
+async def validate_dataset(
+    min_pass_rate: float = 0.95,
+    data_source: str = "default_model_state",
+):
     if not platform:
         raise HTTPException(status_code=503, detail="Platform not initialized")
 
@@ -284,23 +287,64 @@ async def validate_dataset(min_pass_rate: float = 0.95):
                 "failed_points": 0,
                 "issues": ["No model state available for validation"],
                 "checks_summary": {},
+                "data_source": data_source,
                 "status": "no_data",
                 "message": "No model state available. Run a simulation first or use default initialization.",
             }
 
         states = platform.coupled_model.get_combined_state()
-        passed, report = platform.qc_engine.validate(states, min_pass_rate=min_pass_rate)
 
-        return {
-            "passed": passed,
-            "min_pass_rate": min_pass_rate,
-            "overall_pass_rate": report.get("overall_pass_rate", 0),
-            "total_points": report.get("total_points", 0),
-            "failed_points": report.get("failed_points", 0),
-            "issues": report.get("issues", [])[:20],
-            "checks_summary": report.get("results", {}),
-            "status": "ok",
-        }
+        if data_source == "default_model_state" and platform.data_cleaner is not None:
+            qc_result = platform.data_cleaner.run_qc(states)
+            variable_details = qc_result.variable_details
+            all_pass_rates = [
+                details["pass_rate"]
+                for details in variable_details.values()
+            ]
+            overall_pass_rate = float(np.mean(all_pass_rates)) if all_pass_rates else 1.0
+            passed = all(
+                pr >= min_pass_rate for pr in all_pass_rates
+            ) if all_pass_rates else False
+
+            total_points = sum(
+                details["total_points"] for details in variable_details.values()
+            )
+            failed_points = sum(
+                details["failed_points"] for details in variable_details.values()
+            )
+
+            checks_summary = {}
+            for var_name, details in variable_details.items():
+                checks_summary[var_name] = details
+
+            return {
+                "passed": passed,
+                "min_pass_rate": min_pass_rate,
+                "overall_pass_rate": overall_pass_rate,
+                "total_points": total_points,
+                "failed_points": failed_points,
+                "issues": [
+                    f"{f.variable}: {f.check_name} - {f.message}"
+                    for f in qc_result.failures
+                ][:20],
+                "checks_summary": checks_summary,
+                "data_source": data_source,
+                "status": "ok",
+            }
+        else:
+            passed, report = platform.qc_engine.validate(states, min_pass_rate=min_pass_rate)
+
+            return {
+                "passed": passed,
+                "min_pass_rate": min_pass_rate,
+                "overall_pass_rate": report.get("overall_pass_rate", 0),
+                "total_points": report.get("total_points", 0),
+                "failed_points": report.get("failed_points", 0),
+                "issues": report.get("issues", [])[:20],
+                "checks_summary": report.get("results", {}),
+                "data_source": data_source,
+                "status": "ok",
+            }
     except Exception as e:
         logger.error(f"QC validation failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
