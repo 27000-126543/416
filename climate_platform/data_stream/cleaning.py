@@ -3,6 +3,7 @@ Real-time data cleaning module with quality control.
 """
 
 import logging
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -49,16 +50,24 @@ class QualityControlResult:
 
 @dataclass
 class QCSummary:
-    source_id: str
-    source_type: str
+    summary_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    source_id: str = "unknown"
+    source_type: str = "unknown"
     timestamp: datetime = field(default_factory=datetime.now)
+    
     original_anomaly_points: int = 0
     original_nan_count: int = 0
+    original_total_points: int = 0
+    
     cleaned_nan_count: int = 0
+    cleaning_interpolated_points: int = 0
+    
     modified_points: int = 0
-    variable_summaries: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    final_pass_rate: float = 1.0
     passed: bool = True
-    overall_pass_rate: float = 1.0
+    
+    variable_summaries: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    qc_failures_detail: Dict[str, Dict[str, int]] = field(default_factory=dict)
 
 
 class DataCleaner:
@@ -491,11 +500,13 @@ class DataCleaner:
     def run_qc_with_summary(self, ds: xr.Dataset, source_id: str = "unknown", source_type: str = "unknown") -> Tuple[QualityControlResult, QCSummary]:
         original_nan_by_var: Dict[str, int] = {}
         total_original_nan = 0
+        total_original_points = 0
         for var_name in ds.data_vars:
             data = ds[var_name].values
             nan_count = int(np.sum(np.isnan(data)))
             original_nan_by_var[var_name] = nan_count
             total_original_nan += nan_count
+            total_original_points += data.size
 
         result = self.run_qc(ds)
 
@@ -510,6 +521,8 @@ class DataCleaner:
 
         total_modified = 0
         modified_by_var: Dict[str, int] = {}
+        total_interpolated = 0
+        interpolated_by_var: Dict[str, int] = {}
         for var_name in ds.data_vars:
             if var_name not in cleaned_ds.data_vars:
                 continue
@@ -521,8 +534,20 @@ class DataCleaner:
             modified = int(np.sum(both_finite & (orig_data != clean_data)))
             modified_by_var[var_name] = modified
             total_modified += modified
+            
+            orig_nan_mask = np.isnan(orig_data)
+            clean_finite_mask = np.isfinite(clean_data)
+            interpolated = int(np.sum(orig_nan_mask & clean_finite_mask))
+            interpolated_by_var[var_name] = interpolated
+            total_interpolated += interpolated
 
         total_anomaly_points = sum(f.num_failures for f in result.failures)
+
+        qc_failures_detail: Dict[str, Dict[str, int]] = {}
+        for f in result.failures:
+            if f.variable not in qc_failures_detail:
+                qc_failures_detail[f.variable] = {}
+            qc_failures_detail[f.variable][f.check_name] = qc_failures_detail[f.variable].get(f.check_name, 0) + f.num_failures
 
         var_summaries: Dict[str, Dict[str, Any]] = {}
         for var_name in ds.data_vars:
@@ -533,13 +558,16 @@ class DataCleaner:
                 "original_nan": original_nan_by_var.get(var_name, 0),
                 "cleaned_nan": cleaned_nan_by_var.get(var_name, 0),
                 "anomalies": var_anomalies,
+                "interpolated": interpolated_by_var.get(var_name, 0),
                 "modified": modified_by_var.get(var_name, 0),
                 "pass_rate": var_pass_rate,
                 "unit": self.UNIT_MAP.get(var_name, "unknown"),
                 "range_min": self.PHYSICAL_RANGES.get(var_name, (None, None))[0],
                 "range_max": self.PHYSICAL_RANGES.get(var_name, (None, None))[1],
+                "total_points": var_total,
             }
 
+        final_pass_rate = max(0.0, 1.0 - total_cleaned_nan / max(total_original_points, 1))
         passed = result.passed or (result.overall_quality >= self.quality_threshold)
 
         summary = QCSummary(
@@ -547,11 +575,14 @@ class DataCleaner:
             source_type=source_type,
             original_anomaly_points=total_anomaly_points,
             original_nan_count=total_original_nan,
+            original_total_points=total_original_points,
             cleaned_nan_count=total_cleaned_nan,
+            cleaning_interpolated_points=total_interpolated,
             modified_points=total_modified,
+            final_pass_rate=final_pass_rate,
             variable_summaries=var_summaries,
+            qc_failures_detail=qc_failures_detail,
             passed=passed,
-            overall_pass_rate=result.overall_quality,
         )
 
         return result, summary

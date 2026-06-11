@@ -75,6 +75,13 @@ class SourceSession:
     cumulative_chunks: int = 0
     cumulative_bytes: int = 0
     session_rate_mbps: float = 0.0
+    rejected_chunks: int = 0
+    rejected_bytes: int = 0
+    last_rejected_time: Optional[datetime] = None
+    stop_reason: str = ""
+    error_message: str = ""
+    last_data_time: Optional[datetime] = None
+    last_update: datetime = field(default_factory=datetime.now)
 
 
 class DataSource:
@@ -448,6 +455,11 @@ class DataIngestionManager:
         source_id = chunk.source_id
         session = self._sessions.get(source_id)
         if session is None or session.state != SourceSessionState.RUNNING:
+            if session is not None:
+                session.rejected_chunks += 1
+                session.rejected_bytes += chunk.chunk_size_bytes
+                session.last_rejected_time = datetime.now()
+                session.last_update = datetime.now()
             return
 
         self._stats.total_chunks += 1
@@ -465,6 +477,8 @@ class DataIngestionManager:
         session.session_bytes += chunk.chunk_size_bytes
         session.cumulative_chunks += 1
         session.cumulative_bytes += chunk.chunk_size_bytes
+        session.last_data_time = datetime.now()
+        session.last_update = datetime.now()
 
         self._cumulative_stats.total_chunks += 1
         self._cumulative_stats.total_bytes += chunk.chunk_size_bytes
@@ -526,6 +540,7 @@ class DataIngestionManager:
             if session.state == SourceSessionState.RUNNING:
                 session.state = SourceSessionState.STOPPED
                 session.session_end = datetime.now()
+                session.last_update = datetime.now()
         for source in self._sources.values():
             await source.stop()
         logger.info("Stopped data ingestion manager")
@@ -605,7 +620,7 @@ class DataIngestionManager:
                 results[sid] = {"source_id": sid, "session_id": self._current_session_id, "state": SourceSessionState.RUNNING.value}
             return results
 
-    def stop_ingestion(self, source_id: Optional[str] = None) -> Dict:
+    def stop_ingestion(self, source_id: Optional[str] = None, reason: str = "") -> Dict:
         if source_id is not None:
             session = self._sessions.get(source_id)
             if session is None:
@@ -613,6 +628,8 @@ class DataIngestionManager:
             if session.state == SourceSessionState.RUNNING:
                 session.state = SourceSessionState.STOPPED
                 session.session_end = datetime.now()
+                session.stop_reason = reason
+                session.last_update = datetime.now()
             return {"source_id": source_id, "state": session.state.value, "session_chunks": session.session_chunks, "session_bytes": session.session_bytes}
         else:
             results = {}
@@ -620,6 +637,8 @@ class DataIngestionManager:
                 if session.state == SourceSessionState.RUNNING:
                     session.state = SourceSessionState.STOPPED
                     session.session_end = datetime.now()
+                    session.stop_reason = reason
+                    session.last_update = datetime.now()
                 results[sid] = {"source_id": sid, "state": session.state.value, "session_chunks": session.session_chunks, "session_bytes": session.session_bytes}
             return results
 
@@ -628,6 +647,49 @@ class DataIngestionManager:
 
     def get_all_sessions(self) -> Dict[str, SourceSession]:
         return self._sessions.copy()
+
+    def get_source_dashboard(self, source_id: str) -> Optional[Dict[str, Any]]:
+        session = self._sessions.get(source_id)
+        if session is None:
+            return None
+        source = self._sources.get(source_id)
+        if source is None:
+            return None
+        return {
+            "source_id": source_id,
+            "source_type": source.source_type.value,
+            "state": session.state.value,
+            "current_session": {
+                "session_start": session.session_start,
+                "session_end": session.session_end,
+                "session_chunks": session.session_chunks,
+                "session_bytes": session.session_bytes,
+                "session_rate_mbps": session.session_rate_mbps,
+                "last_data_time": session.last_data_time,
+            },
+            "cumulative": {
+                "chunks": session.cumulative_chunks,
+                "bytes": session.cumulative_bytes,
+            },
+            "rejection": {
+                "rejected_chunks": session.rejected_chunks,
+                "rejected_bytes": session.rejected_bytes,
+                "last_rejected_time": session.last_rejected_time,
+            },
+            "status": {
+                "stop_reason": session.stop_reason,
+                "error_message": session.error_message,
+            },
+            "last_update": session.last_update,
+        }
+
+    def get_all_dashboards(self) -> Dict[str, Dict[str, Any]]:
+        result = {}
+        for source_id in self._sources:
+            dashboard = self.get_source_dashboard(source_id)
+            if dashboard is not None:
+                result[source_id] = dashboard
+        return result
 
     def get_cumulative_stats(self) -> IngestionStats:
         return self._cumulative_stats

@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import xarray as xr
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, Body
 from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel, Field
 
@@ -49,6 +49,14 @@ class StatusResponse(BaseModel):
     timestamp: str
 
 
+class PipelineValidateRequest(BaseModel):
+    variable_name: str
+    data: List[List[float]]
+    latitudes: List[float]
+    longitudes: List[float]
+    unit: Optional[str] = None
+
+
 @app.on_event("startup")
 async def startup_event():
     global platform
@@ -71,6 +79,12 @@ async def root():
             "/fingerprint/search",
             "/tenants",
             "/qc/validate",
+            "/qc/history",
+            "/ingestion/pipeline/validate",
+            "/ingestion/pipeline/summaries",
+            "/ingestion/dashboard",
+            "/ingestion/sources/{source_id}/start",
+            "/ingestion/sources/{source_id}/stop",
         ],
     }
 
@@ -281,6 +295,138 @@ async def get_tenant_usage(tenant_id: str):
     return usage
 
 
+@app.post("/tenants/{tenant_id}/allocate", tags=["Multi-Tenant"])
+async def allocate_tenant_resources(
+    tenant_id: str,
+    storage_tb: float = Body(0.0, embed=True),
+    compute_hours_month: float = Body(0.0, embed=True),
+    concurrent_jobs: int = Body(0, embed=True),
+    memory_gb: float = Body(0.0, embed=True),
+    gpu_count: int = Body(0, embed=True),
+    bandwidth_gbps: float = Body(0.0, embed=True),
+):
+    if not platform:
+        raise HTTPException(status_code=503, detail="Platform not initialized")
+
+    from .multi_tenant.manager import ResourceQuota
+    requested = ResourceQuota(
+        storage_tb=storage_tb,
+        compute_hours_month=compute_hours_month,
+        concurrent_jobs=concurrent_jobs,
+        memory_gb=memory_gb,
+        gpu_count=gpu_count,
+        bandwidth_gbps=bandwidth_gbps,
+    )
+
+    ok, reasons = platform.tenant_manager.allocate_resources_detailed(tenant_id, requested)
+    if not ok:
+        return {
+            "success": False,
+            "tenant_id": tenant_id,
+            "requested": {
+                "storage_tb": storage_tb,
+                "compute_hours_month": compute_hours_month,
+                "concurrent_jobs": concurrent_jobs,
+                "memory_gb": memory_gb,
+                "gpu_count": gpu_count,
+                "bandwidth_gbps": bandwidth_gbps,
+            },
+            "insufficient": reasons,
+            "current_usage": platform.tenant_manager.get_tenant_usage(tenant_id),
+        }
+
+    return {
+        "success": True,
+        "tenant_id": tenant_id,
+        "requested": {
+            "storage_tb": storage_tb,
+            "compute_hours_month": compute_hours_month,
+            "concurrent_jobs": concurrent_jobs,
+            "memory_gb": memory_gb,
+            "gpu_count": gpu_count,
+            "bandwidth_gbps": bandwidth_gbps,
+        },
+        "current_usage": platform.tenant_manager.get_tenant_usage(tenant_id),
+    }
+
+
+@app.post("/tenants/{tenant_id}/release", tags=["Multi-Tenant"])
+async def release_tenant_resources(
+    tenant_id: str,
+    storage_tb: float = Body(0.0, embed=True),
+    compute_hours_month: float = Body(0.0, embed=True),
+    concurrent_jobs: int = Body(0, embed=True),
+    memory_gb: float = Body(0.0, embed=True),
+    gpu_count: int = Body(0, embed=True),
+    bandwidth_gbps: float = Body(0.0, embed=True),
+):
+    if not platform:
+        raise HTTPException(status_code=503, detail="Platform not initialized")
+
+    from .multi_tenant.manager import ResourceQuota
+    released = ResourceQuota(
+        storage_tb=storage_tb,
+        compute_hours_month=compute_hours_month,
+        concurrent_jobs=concurrent_jobs,
+        memory_gb=memory_gb,
+        gpu_count=gpu_count,
+        bandwidth_gbps=bandwidth_gbps,
+    )
+
+    tenant = platform.tenant_manager.get_tenant(tenant_id)
+    if tenant is None:
+        raise HTTPException(status_code=404, detail=f"Tenant {tenant_id} not found")
+
+    platform.tenant_manager.release_resources(tenant_id, released)
+
+    return {
+        "success": True,
+        "tenant_id": tenant_id,
+        "released": {
+            "storage_tb": storage_tb,
+            "compute_hours_month": compute_hours_month,
+            "concurrent_jobs": concurrent_jobs,
+            "memory_gb": memory_gb,
+            "gpu_count": gpu_count,
+            "bandwidth_gbps": bandwidth_gbps,
+        },
+        "current_usage": platform.tenant_manager.get_tenant_usage(tenant_id),
+    }
+
+
+@app.get("/tenants/{tenant_id}/history", tags=["Multi-Tenant"])
+async def get_tenant_history(
+    tenant_id: str,
+    event_type: Optional[str] = Query(None, description="Filter by event type: allocate or release"),
+    limit: int = Query(50, ge=1, le=500),
+):
+    if not platform:
+        raise HTTPException(status_code=503, detail="Platform not initialized")
+
+    tenant = platform.tenant_manager.get_tenant(tenant_id)
+    if tenant is None:
+        raise HTTPException(status_code=404, detail=f"Tenant {tenant_id} not found")
+
+    history = platform.tenant_manager.get_tenant_history(tenant_id, event_type=event_type)
+    recent = history[-limit:] if len(history) > limit else history
+
+    events = []
+    for evt in reversed(recent):
+        events.append({
+            "event_id": evt.event_id,
+            "event_type": evt.event_type,
+            "timestamp": evt.timestamp.isoformat(),
+            "resources": evt.resources,
+            "reason": evt.reason,
+        })
+
+    return {
+        "tenant_id": tenant_id,
+        "total_events": len(history),
+        "events": events,
+    }
+
+
 @app.post("/qc/validate", tags=["Quality Control"])
 async def validate_dataset(
     min_pass_rate: float = 0.95,
@@ -290,16 +436,22 @@ async def validate_dataset(
         raise HTTPException(status_code=503, detail="Platform not initialized")
 
     try:
+        import uuid
+
         if not platform.coupled_model or not platform.coupled_model.states:
             return {
+                "record_id": str(uuid.uuid4()),
+                "timestamp": datetime.now().isoformat(),
+                "data_source": data_source,
                 "passed": False,
                 "min_pass_rate": min_pass_rate,
                 "overall_pass_rate": 0.0,
                 "total_points": 0,
                 "failed_points": 0,
+                "variables": [],
+                "variable_details": {},
                 "issues": ["No model state available for validation"],
                 "checks_summary": {},
-                "data_source": data_source,
                 "status": "no_data",
                 "message": "No model state available. Run a simulation first or use default initialization.",
             }
@@ -325,40 +477,313 @@ async def validate_dataset(
                 details["failed_points"] for details in variable_details.values()
             )
 
-            checks_summary = {}
-            for var_name, details in variable_details.items():
-                checks_summary[var_name] = details
+            issues = [
+                f"{f.variable}: {f.check_name} - {f.message}"
+                for f in qc_result.failures
+            ][:20]
+
+            variables = list(variable_details.keys())
+
+            record_id = str(uuid.uuid4())
+            timestamp = datetime.now().isoformat()
 
             return {
+                "record_id": record_id,
+                "timestamp": timestamp,
+                "data_source": data_source,
                 "passed": passed,
                 "min_pass_rate": min_pass_rate,
                 "overall_pass_rate": overall_pass_rate,
                 "total_points": total_points,
                 "failed_points": failed_points,
-                "issues": [
-                    f"{f.variable}: {f.check_name} - {f.message}"
-                    for f in qc_result.failures
-                ][:20],
-                "checks_summary": checks_summary,
-                "data_source": data_source,
+                "variables": variables,
+                "variable_details": variable_details,
+                "issues": issues,
+                "checks_summary": variable_details,
                 "status": "ok",
             }
         else:
-            passed, report = platform.qc_engine.validate(states, min_pass_rate=min_pass_rate)
+            passed, report = platform.qc_engine.validate(
+                states, min_pass_rate=min_pass_rate, data_source=data_source
+            )
 
             return {
+                "record_id": report.get("record_id"),
+                "timestamp": report.get("timestamp"),
+                "data_source": data_source,
                 "passed": passed,
                 "min_pass_rate": min_pass_rate,
                 "overall_pass_rate": report.get("overall_pass_rate", 0),
                 "total_points": report.get("total_points", 0),
                 "failed_points": report.get("failed_points", 0),
+                "variables": report.get("variables", []),
+                "variable_details": report.get("variable_details", {}),
                 "issues": report.get("issues", [])[:20],
                 "checks_summary": report.get("results", {}),
-                "data_source": data_source,
                 "status": "ok",
             }
     except Exception as e:
         logger.error(f"QC validation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/qc/history", tags=["Quality Control"])
+async def get_qc_history(
+    data_source: Optional[str] = Query(None, description="Filter by data source"),
+    variable: Optional[str] = Query(None, description="Filter by variable name"),
+    passed: Optional[bool] = Query(None, description="Filter by pass status"),
+    start_time: Optional[str] = Query(None, description="Start time (ISO format)"),
+    end_time: Optional[str] = Query(None, description="End time (ISO format)"),
+    limit: int = Query(100, ge=1, le=1000, description="Maximum number of records"),
+):
+    if not platform:
+        raise HTTPException(status_code=503, detail="Platform not initialized")
+
+    try:
+        start_dt = None
+        end_dt = None
+
+        if start_time:
+            try:
+                start_dt = datetime.fromisoformat(start_time)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid start_time format, use ISO format")
+
+        if end_time:
+            try:
+                end_dt = datetime.fromisoformat(end_time)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid end_time format, use ISO format")
+
+        records = platform.qc_engine.query_history(
+            data_source=data_source,
+            variable=variable,
+            passed=passed,
+            start_time=start_dt,
+            end_time=end_dt,
+            limit=limit,
+        )
+
+        summaries = []
+        for record in records:
+            summaries.append({
+                "record_id": record.record_id,
+                "data_source": record.data_source,
+                "passed": record.passed,
+                "pass_rate": record.overall_pass_rate,
+                "timestamp": record.timestamp.isoformat(),
+                "variables": record.variables,
+                "num_issues": len(record.issues),
+            })
+
+        return {
+            "total": len(summaries),
+            "limit": limit,
+            "records": summaries,
+        }
+    except Exception as e:
+        logger.error(f"QC history query failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ingestion/pipeline/validate", tags=["Ingestion Pipeline"])
+async def validate_pipeline(
+    request: PipelineValidateRequest,
+    source_id: str = Query("unknown", description="Source identifier"),
+    source_type: str = Query("satellite_remote_sensing", description="Source type"),
+):
+    if not platform:
+        raise HTTPException(status_code=503, detail="Platform not initialized")
+    
+    if not platform.data_cleaner:
+        raise HTTPException(status_code=503, detail="Data cleaner not initialized")
+    
+    try:
+        import numpy as np
+        import xarray as xr
+        
+        data_array = np.array(request.data)
+        lat_array = np.array(request.latitudes)
+        lon_array = np.array(request.longitudes)
+        
+        ds = xr.Dataset(
+            {
+                request.variable_name: (["lat", "lon"], data_array),
+            },
+            coords={
+                "lat": lat_array,
+                "lon": lon_array,
+            },
+        )
+        
+        if request.unit:
+            ds[request.variable_name].attrs["units"] = request.unit
+        
+        result, summary = platform.data_cleaner.run_qc_with_summary(
+            ds, source_id=source_id, source_type=source_type
+        )
+        
+        if platform.ingestion_manager:
+            platform.ingestion_manager._qc_summaries.append(summary)
+        
+        summary_dict = {
+            "summary_id": summary.summary_id,
+            "source_id": summary.source_id,
+            "source_type": summary.source_type,
+            "timestamp": summary.timestamp.isoformat(),
+            "original_anomaly_points": summary.original_anomaly_points,
+            "original_nan_count": summary.original_nan_count,
+            "original_total_points": summary.original_total_points,
+            "cleaned_nan_count": summary.cleaned_nan_count,
+            "cleaning_interpolated_points": summary.cleaning_interpolated_points,
+            "modified_points": summary.modified_points,
+            "final_pass_rate": summary.final_pass_rate,
+            "passed": summary.passed,
+            "variable_summaries": summary.variable_summaries,
+            "qc_failures_detail": summary.qc_failures_detail,
+        }
+        
+        return {
+            "status": "completed",
+            "summary": summary_dict,
+        }
+    except Exception as e:
+        logger.error(f"Pipeline validation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/ingestion/pipeline/summaries", tags=["Ingestion Pipeline"])
+async def get_pipeline_summaries(
+    limit: int = Query(10, ge=1, le=1000, description="Maximum number of summaries to return"),
+    source_id: Optional[str] = Query(None, description="Filter by source ID"),
+):
+    if not platform:
+        raise HTTPException(status_code=503, detail="Platform not initialized")
+    
+    try:
+        summaries = []
+        if platform.ingestion_manager:
+            all_summaries = platform.ingestion_manager.get_qc_summaries()
+            if source_id:
+                all_summaries = [s for s in all_summaries if s.source_id == source_id]
+            
+            for summary in all_summaries[-limit:]:
+                summaries.append({
+                    "summary_id": summary.summary_id,
+                    "source_id": summary.source_id,
+                    "source_type": summary.source_type,
+                    "timestamp": summary.timestamp.isoformat(),
+                    "original_anomaly_points": summary.original_anomaly_points,
+                    "original_nan_count": summary.original_nan_count,
+                    "original_total_points": summary.original_total_points,
+                    "cleaned_nan_count": summary.cleaned_nan_count,
+                    "cleaning_interpolated_points": summary.cleaning_interpolated_points,
+                    "modified_points": summary.modified_points,
+                    "final_pass_rate": summary.final_pass_rate,
+                    "passed": summary.passed,
+                })
+        
+        return {
+            "total": len(summaries),
+            "limit": limit,
+            "summaries": summaries,
+        }
+    except Exception as e:
+        logger.error(f"Failed to get pipeline summaries: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/ingestion/dashboard", tags=["Ingestion Pipeline"])
+async def get_ingestion_dashboard():
+    if not platform:
+        raise HTTPException(status_code=503, detail="Platform not initialized")
+    
+    if not platform.ingestion_manager:
+        raise HTTPException(status_code=503, detail="Ingestion manager not initialized")
+    
+    try:
+        dashboards = platform.ingestion_manager.get_all_dashboards()
+        
+        result = {}
+        for source_id, dashboard in dashboards.items():
+            result[source_id] = {
+                "source_id": dashboard["source_id"],
+                "source_type": dashboard["source_type"],
+                "state": dashboard["state"],
+                "session": {
+                    "session_start": dashboard["current_session"]["session_start"].isoformat() if dashboard["current_session"]["session_start"] else None,
+                    "session_end": dashboard["current_session"]["session_end"].isoformat() if dashboard["current_session"]["session_end"] else None,
+                    "session_chunks": dashboard["current_session"]["session_chunks"],
+                    "session_bytes": dashboard["current_session"]["session_bytes"],
+                    "session_rate_mbps": dashboard["current_session"]["session_rate_mbps"],
+                    "last_data_time": dashboard["current_session"]["last_data_time"].isoformat() if dashboard["current_session"]["last_data_time"] else None,
+                },
+                "cumulative": dashboard["cumulative"],
+                "rejection": {
+                    "rejected_chunks": dashboard["rejection"]["rejected_chunks"],
+                    "rejected_bytes": dashboard["rejection"]["rejected_bytes"],
+                    "last_rejected_time": dashboard["rejection"]["last_rejected_time"].isoformat() if dashboard["rejection"]["last_rejected_time"] else None,
+                },
+                "status": dashboard["status"],
+                "last_update": dashboard["last_update"].isoformat() if dashboard["last_update"] else None,
+            }
+        
+        return {
+            "total_sources": len(result),
+            "sources": result,
+        }
+    except Exception as e:
+        logger.error(f"Failed to get ingestion dashboard: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ingestion/sources/{source_id}/start", tags=["Ingestion Pipeline"])
+async def start_ingestion_source(source_id: str):
+    if not platform:
+        raise HTTPException(status_code=503, detail="Platform not initialized")
+    
+    if not platform.ingestion_manager:
+        raise HTTPException(status_code=503, detail="Ingestion manager not initialized")
+    
+    try:
+        result = platform.ingestion_manager.start_ingestion(source_id=source_id)
+        return {
+            "status": "started",
+            "source_id": result["source_id"],
+            "session_id": result["session_id"],
+            "state": result["state"],
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Failed to start ingestion for {source_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ingestion/sources/{source_id}/stop", tags=["Ingestion Pipeline"])
+async def stop_ingestion_source(
+    source_id: str,
+    reason: str = Query("", description="Reason for stopping"),
+):
+    if not platform:
+        raise HTTPException(status_code=503, detail="Platform not initialized")
+    
+    if not platform.ingestion_manager:
+        raise HTTPException(status_code=503, detail="Ingestion manager not initialized")
+    
+    try:
+        result = platform.ingestion_manager.stop_ingestion(source_id=source_id, reason=reason)
+        return {
+            "status": "stopped",
+            "source_id": result["source_id"],
+            "state": result["state"],
+            "session_chunks": result["session_chunks"],
+            "session_bytes": result["session_bytes"],
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Failed to stop ingestion for {source_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

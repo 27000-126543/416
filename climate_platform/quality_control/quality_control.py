@@ -38,6 +38,21 @@ class QCResult:
         return 1.0 - self.failed_points / self.total_points
 
 
+@dataclass
+class ValidationRecord:
+    record_id: str
+    data_source: str
+    passed: bool
+    overall_pass_rate: float
+    total_points: int
+    failed_points: int
+    min_pass_rate: float
+    timestamp: datetime
+    variables: List[str]
+    variable_details: Dict[str, Dict[str, Any]]
+    issues: List[str]
+
+
 class QualityCheck(ABC):
     def __init__(self, name: str, enabled: bool = True):
         self.name = name
@@ -60,10 +75,21 @@ class RangeCheck(QualityCheck):
         "pressure": "Pa",
         "surface_pressure": "Pa",
         "wind_speed": "m/s",
+        "u_wind": "m/s",
+        "v_wind": "m/s",
+        "wind_direction": "degree",
         "precipitation": "mm",
         "salinity": "PSU",
         "sea_ice_concentration": "fraction",
+        "sea_ice_thickness": "m",
+        "soil_moisture": "m3/m3",
+        "albedo": "fraction",
+        "cloud_cover": "fraction",
         "geopotential_height": "m",
+        "shortwave_radiation": "W/m2",
+        "sensible_heat_flux": "W/m2",
+        "latent_heat_flux": "W/m2",
+        "evapotranspiration": "mm",
     }
 
     RANGE_KELVIN = {
@@ -73,18 +99,29 @@ class RangeCheck(QualityCheck):
         "sea_surface_temperature": (271.0, 305.0),
         "skin_temperature": (200.0, 330.0),
         "sea_ice_temperature": (200.0, 273.0),
+        "pressure": (87000.0, 108500.0),
         "surface_pressure": (87000.0, 108500.0),
         "pressure_sea_level": (87000.0, 108500.0),
+        "wind_speed": (0.0, 100.0),
         "wind_speed_10m": (0.0, 85.0),
         "wind_direction": (0.0, 360.0),
         "wind_direction_10m": (0.0, 360.0),
+        "u_wind": (-150.0, 150.0),
+        "v_wind": (-150.0, 150.0),
+        "relative_humidity": (0.0, 100.0),
+        "specific_humidity": (0.0, 0.05),
+        "precipitation": (0.0, 1000.0),
+        "salinity": (0.0, 42.0),
         "sea_ice_concentration": (0.0, 1.0),
         "sea_ice_thickness": (0.0, 50.0),
         "soil_moisture": (0.0, 1.0),
         "albedo": (0.0, 1.0),
         "cloud_cover": (0.0, 1.0),
-        "u_wind": (-150.0, 150.0),
-        "v_wind": (-150.0, 150.0),
+        "geopotential_height": (0.0, 50000.0),
+        "shortwave_radiation": (0.0, 1500.0),
+        "sensible_heat_flux": (-500.0, 500.0),
+        "latent_heat_flux": (-500.0, 500.0),
+        "evapotranspiration": (0.0, 100.0),
     }
 
     PHYSICAL_RANGES = {
@@ -706,6 +743,7 @@ class QualityControlEngine:
         self.version_tracker = VersionTracker()
         self.provenance = ProvenanceGraph()
         self._qc_history: List[Dict[str, Any]] = []
+        self._validation_history: List[ValidationRecord] = []
 
     def add_check(self, check: QualityCheck):
         self.checks.append(check)
@@ -744,30 +782,92 @@ class QualityControlEngine:
         dataset: xr.Dataset,
         variables: Optional[List[str]] = None,
         min_pass_rate: float = 0.95,
+        data_source: str = "default",
     ) -> Tuple[bool, Dict[str, Any]]:
         results = self.run_checks(dataset, variables)
         issues = []
         overall_pass_rate = 1.0
         total = 0
         failed = 0
+        vars_to_check = variables or list(dataset.data_vars)
+        variable_details: Dict[str, Dict[str, Any]] = {}
 
         for var, var_results in results.items():
+            var_total = 0
+            var_failed = 0
+            var_passed_checks = 0
+            var_checks = []
+            var_unit = "unknown"
+            var_range_min = None
+            var_range_max = None
+
             for r in var_results:
                 total += max(1, r.total_points)
                 failed += r.failed_points
+                var_total += max(1, r.total_points)
+                var_failed += r.failed_points
+                if r.passed:
+                    var_passed_checks += 1
                 if not r.passed:
                     issues.append(f"{var}: {r.check_name} - {'; '.join(r.error_details)}")
+                if "unit" in r.stats:
+                    var_unit = r.stats["unit"]
+                if "range_min" in r.stats:
+                    var_range_min = r.stats["range_min"]
+                if "range_max" in r.stats:
+                    var_range_max = r.stats["range_max"]
+                var_checks.append({
+                    "check": r.check_name,
+                    "passed": r.passed,
+                    "pass_rate": r.pass_rate,
+                    "failed_points": r.failed_points,
+                    "total_points": r.total_points,
+                })
+
+            var_pass_rate = 1.0 - var_failed / var_total if var_total > 0 else 1.0
+            variable_details[var] = {
+                "pass_rate": var_pass_rate,
+                "total_points": var_total,
+                "failed_points": var_failed,
+                "passed_checks": var_passed_checks,
+                "total_checks": len(var_results),
+                "unit": var_unit,
+                "range_min": var_range_min,
+                "range_max": var_range_max,
+                "checks": var_checks,
+            }
 
         overall_pass_rate = 1.0 - failed / total if total > 0 else 1.0
         passed = overall_pass_rate >= min_pass_rate
 
+        record = ValidationRecord(
+            record_id=str(uuid.uuid4()),
+            data_source=data_source,
+            passed=passed,
+            overall_pass_rate=overall_pass_rate,
+            total_points=total,
+            failed_points=failed,
+            min_pass_rate=min_pass_rate,
+            timestamp=datetime.now(),
+            variables=vars_to_check,
+            variable_details=variable_details,
+            issues=issues,
+        )
+        self._validation_history.append(record)
+
         report = {
+            "record_id": record.record_id,
+            "timestamp": record.timestamp.isoformat(),
+            "data_source": data_source,
             "passed": passed,
             "overall_pass_rate": overall_pass_rate,
             "total_points": total,
             "failed_points": failed,
+            "min_pass_rate": min_pass_rate,
             "issues": issues,
             "checks_run": len(self.checks),
+            "variables": vars_to_check,
+            "variable_details": variable_details,
             "results": {
                 var: [
                     {
@@ -869,3 +969,38 @@ class QualityControlEngine:
         if dataset_name is None:
             return self._qc_history.copy()
         return [h for h in self._qc_history if dataset_name in str(h.get("variables", []))]
+
+    def query_history(
+        self,
+        data_source: Optional[str] = None,
+        variable: Optional[str] = None,
+        passed: Optional[bool] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        limit: int = 100,
+    ) -> List[ValidationRecord]:
+        filtered = self._validation_history
+
+        if data_source is not None:
+            filtered = [r for r in filtered if r.data_source == data_source]
+
+        if variable is not None:
+            filtered = [r for r in filtered if variable in r.variables]
+
+        if passed is not None:
+            filtered = [r for r in filtered if r.passed == passed]
+
+        if start_time is not None:
+            filtered = [r for r in filtered if r.timestamp >= start_time]
+
+        if end_time is not None:
+            filtered = [r for r in filtered if r.timestamp <= end_time]
+
+        filtered = sorted(filtered, key=lambda r: r.timestamp, reverse=True)
+        return filtered[:limit]
+
+    def get_validation_history(self, limit: Optional[int] = None) -> List[ValidationRecord]:
+        records = sorted(self._validation_history, key=lambda r: r.timestamp, reverse=True)
+        if limit is not None:
+            return records[:limit]
+        return records
